@@ -1,0 +1,363 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// ██  BOOKMAP-STYLE LIQUIDITY HEATMAP & ORDER FLOW INDICATOR  ██
+// ══════════════════════════════════════════════════════════════════════════════
+// Pine Script v6 | TradingView
+// Approximates Bookmap visualization using price-action & volume analysis.
+// Features: Liquidity Heatmap, Order Flow Proxy, Volume Dots, Smart Signals
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("Bookmap Heatmap & Order Flow", shorttitle = "BM-Heatmap",
+     overlay = true, max_boxes_count = 500, max_labels_count = 500,
+     max_lines_count = 500)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │                         INPUT GROUPS                                    │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// ── Feature Toggles ─────────────────────────────────────────────────────────
+string GRP_TOGGLE   = "═══ Feature Toggles ═══"
+bool   i_showHeatmap = input.bool(true,  "Show Liquidity Heatmap",  group = GRP_TOGGLE)
+bool   i_showDots    = input.bool(true,  "Show Volume Dots",        group = GRP_TOGGLE)
+bool   i_showDelta   = input.bool(true,  "Show Cumulative Delta",   group = GRP_TOGGLE)
+bool   i_showSignals = input.bool(true,  "Show Smart Signals",      group = GRP_TOGGLE)
+bool   i_showAbsZone = input.bool(true,  "Highlight Absorption Zones", group = GRP_TOGGLE)
+
+// ── Heatmap Settings ────────────────────────────────────────────────────────
+string GRP_HEAT     = "═══ Liquidity Heatmap ═══"
+int    i_heatLen    = input.int(50,   "Rolling Window Length",     minval = 10, maxval = 200, group = GRP_HEAT)
+float  i_heatThresh = input.float(1.5,"Volume Threshold (x avg)", minval = 0.5,maxval = 5.0, step = 0.1, group = GRP_HEAT)
+int    i_heatAlpha  = input.int(85,   "Box Opacity (0-100)",       minval = 10, maxval = 100, group = GRP_HEAT)
+int    i_boxLife     = input.int(20,   "Zone Display Bars",         minval = 5,  maxval = 100, group = GRP_HEAT)
+
+// ── Order Flow Settings ─────────────────────────────────────────────────────
+string GRP_FLOW     = "═══ Order Flow Proxy ═══"
+int    i_deltaLen   = input.int(14,   "Delta Smoothing Length",    minval = 1,  maxval = 50,  group = GRP_FLOW)
+float  i_wickWeight = input.float(0.3,"Wick Influence Weight",    minval = 0.0,maxval = 1.0, step = 0.05, group = GRP_FLOW)
+
+// ── Volume Dots Settings ────────────────────────────────────────────────────
+string GRP_DOTS     = "═══ Volume Dots ═══"
+int    i_dotVolLen  = input.int(20,   "Volume SMA Length",         minval = 5,  maxval = 100, group = GRP_DOTS)
+float  i_dotMinRel  = input.float(0.5,"Min Relative Vol (filter)", minval = 0.1,maxval = 2.0, step = 0.1, group = GRP_DOTS)
+
+// ── Smart Signal Settings ───────────────────────────────────────────────────
+string GRP_SIG      = "═══ Smart Signals ═══"
+float  i_absRangeK  = input.float(0.3,"Absorption: Max Range/ATR", minval = 0.1,maxval = 1.0, step = 0.05, group = GRP_SIG)
+float  i_absVolK    = input.float(2.0,"Absorption: Min Vol Mult",  minval = 1.0,maxval = 5.0, step = 0.25, group = GRP_SIG)
+float  i_brkVolK    = input.float(1.8,"Breakout: Min Vol Mult",    minval = 1.0,maxval = 5.0, step = 0.25, group = GRP_SIG)
+int    i_brkLookbk  = input.int(20,   "Breakout Lookback",         minval = 5,  maxval = 100, group = GRP_SIG)
+int    i_divLen      = input.int(14,   "Divergence Lookback",       minval = 5,  maxval = 50,  group = GRP_SIG)
+
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │               CORE CALCULATIONS (run every bar)                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// ── ATR for normalization ───────────────────────────────────────────────────
+float atr14 = ta.atr(14)
+
+// ── Volume baseline ─────────────────────────────────────────────────────────
+float volSma   = ta.sma(volume, i_dotVolLen)
+float relVol   = volSma > 0 ? volume / volSma : 0.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 1 — ORDER FLOW PROXY (Delta Estimation)
+// ══════════════════════════════════════════════════════════════════════════════
+// Estimates buy/sell pressure from candle anatomy:
+//   • Body direction  → base bias
+//   • Close position  → strength within range
+//   • Wick analysis   → rejection / absorption signal
+// ──────────────────────────────────────────────────────────────────────────────
+
+float bodyLen    = math.abs(close - open)
+float totalRange = high - low
+float upperWick  = high - math.max(close, open)
+float lowerWick  = math.min(close, open) - low
+
+// Close position in range: 1.0 = closed at high, 0.0 = closed at low
+float closePos   = totalRange > 0 ? (close - low) / totalRange : 0.5
+
+// Buy pressure ratio (0 → all sell, 1 → all buy)
+// Body contributes direction; wick analysis adds nuance
+float bodyBias   = close >= open ? closePos : (1.0 - closePos)
+
+// Wick pressure: large lower wick = buying absorption, large upper wick = selling
+float wickBias   = totalRange > 0 ? (lowerWick - upperWick) / totalRange : 0.0
+
+// Composite buy ratio [0, 1]
+float buyRatio   = math.max(0.0, math.min(1.0, bodyBias * (1.0 - i_wickWeight) + (wickBias * 0.5 + 0.5) * i_wickWeight))
+
+// Volume-weighted delta: positive = net buying, negative = net selling
+float buyVol     = volume * buyRatio
+float sellVol    = volume * (1.0 - buyRatio)
+float delta      = buyVol - sellVol
+
+// Smoothed delta
+float deltaSmooth = ta.ema(delta, i_deltaLen)
+
+// Cumulative delta — persistent across bars
+var float cumDelta = 0.0
+cumDelta += delta
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 2 — LIQUIDITY HEATMAP (Per-Bar Rendering)
+// ══════════════════════════════════════════════════════════════════════════════
+// Two-layer heatmap visible across the ENTIRE chart:
+//   Layer 1 — bgcolor: tints every bar by volume intensity (always visible)
+//   Layer 2 — boxes:   draws price-range boxes on high-volume bars that
+//             extend rightward, creating a Bookmap-like "heat trail"
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ── Volume baseline for heatmap (uses its own lookback) ─────────────────────
+float heatVolSma = ta.sma(volume, i_heatLen)
+float heatRelVol = heatVolSma > 0 ? volume / heatVolSma : 0.0
+
+// ── Helper: compute heatmap color from intensity [0, 1] ─────────────────────
+// Gradient: Blue(cold) → Cyan → Yellow(warm) → Orange → Red(hot)
+heatColor(float _intensity, int _alpha) =>
+    color out = na
+    if _intensity < 0.33
+        // Blue → Cyan
+        float t = _intensity / 0.33
+        out := color.rgb(0, math.round(t * 220), math.round(255 - t * 55), _alpha)
+    else if _intensity < 0.66
+        // Cyan → Yellow
+        float t = (_intensity - 0.33) / 0.33
+        out := color.rgb(math.round(t * 255), math.round(220 + t * 35), math.round(200 * (1.0 - t)), _alpha)
+    else
+        // Yellow → Red
+        float t = (_intensity - 0.66) / 0.34
+        out := color.rgb(255, math.round(255 * (1.0 - t)), 0, _alpha)
+    out
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LAYER 1 — Background Tint (always visible, zero box cost)
+// ══════════════════════════════════════════════════════════════════════════════
+// Tints the candle background based on how extreme volume is.
+// Even at low thresholds you get a subtle color wash across the chart.
+
+float bgIntensity  = heatRelVol > i_heatThresh ? math.min(1.0, (heatRelVol - i_heatThresh) / (i_heatThresh * 3)) : 0.0
+// Map intensity to transparency: high intensity = more opaque (lower transp)
+int   bgTransp     = bgIntensity > 0 ? math.round(96 - bgIntensity * 40) : 100
+color bgHeatClr    = bgIntensity > 0 ? heatColor(bgIntensity, bgTransp) : na
+
+bgcolor(i_showHeatmap ? bgHeatClr : na, title = "Heatmap BG Layer")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LAYER 2 — Price-Range Boxes (Bookmap-style heat trails)
+// ══════════════════════════════════════════════════════════════════════════════
+// On every bar where volume exceeds threshold, draw a box spanning the bar's
+// price range and extending rightward by i_boxLife bars.  This creates
+// persistent "heat zones" that look like order-book depth on the chart.
+
+// Persistent array to track boxes and enforce the 500 limit
+var array<box> heatBoxes = array.new_box()
+
+if i_showHeatmap and heatRelVol > i_heatThresh
+    float boxIntensity = math.min(1.0, (heatRelVol - i_heatThresh) / (i_heatThresh * 2.5))
+    int   boxAlpha     = 100 - i_heatAlpha
+    color boxClr       = heatColor(boxIntensity, boxAlpha)
+
+    // Extend the box rightward so the zone lingers on chart
+    box newBox = box.new(bar_index, high, bar_index + i_boxLife, low,
+         border_color = color.new(boxClr, 80),
+         bgcolor      = boxClr,
+         border_width = 0)
+    array.push(heatBoxes, newBox)
+
+    // Enforce TradingView box limit — delete oldest when approaching cap
+    while array.size(heatBoxes) > 450
+        box.delete(array.shift(heatBoxes))
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 3 — ABSORPTION ZONE HIGHLIGHTING
+// ══════════════════════════════════════════════════════════════════════════════
+// Absorption = high volume + very small range (buyers/sellers absorbing flow)
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool isAbsorption = totalRange < atr14 * i_absRangeK and relVol > i_absVolK
+
+// Background tint for absorption bars
+bgcolor(i_showAbsZone and isAbsorption ? color.new(#7B1FA2, 80) : na,
+     title = "Absorption Zone")
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 4 — VOLUME DOTS
+// ══════════════════════════════════════════════════════════════════════════════
+// Circles at bar midpoint, sized by relative volume, colored by delta.
+// Uses three size tiers to approximate continuous sizing.
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool showDot    = i_showDots and relVol >= i_dotMinRel
+color dotColor  = delta >= 0 ? color.new(#00E676, 20) : color.new(#FF1744, 20)
+
+// Size tiers
+bool isTiny     = showDot and relVol < 1.0
+bool isSmall    = showDot and relVol >= 1.0 and relVol < 2.0
+bool isMedium   = showDot and relVol >= 2.0 and relVol < 3.5
+bool isLarge    = showDot and relVol >= 3.5
+
+plotshape(isTiny   ? low - atr14 * 0.3 : na, style = shape.circle, location = location.absolute,
+     color = dotColor, size = size.tiny, title = "Vol Dot Tiny")
+plotshape(isSmall  ? low - atr14 * 0.3 : na, style = shape.circle, location = location.absolute,
+     color = dotColor, size = size.small, title = "Vol Dot Small")
+plotshape(isMedium ? low - atr14 * 0.3 : na, style = shape.circle, location = location.absolute,
+     color = dotColor, size = size.normal, title = "Vol Dot Medium")
+plotshape(isLarge  ? low - atr14 * 0.3 : na, style = shape.circle, location = location.absolute,
+     color = dotColor, size = size.large, title = "Vol Dot Large")
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 5 — CUMULATIVE DELTA HISTOGRAM (separate pane via plot)
+// ══════════════════════════════════════════════════════════════════════════════
+// Shown as a line on the main chart is impractical — use a secondary plot
+// that the user can drag to a separate pane if desired.
+// ──────────────────────────────────────────────────────────────────────────────
+
+plot(i_showDelta ? deltaSmooth : na,
+     title = "Smoothed Delta", color = deltaSmooth >= 0 ? #00E676 : #FF1744,
+     style = plot.style_columns, linewidth = 2, display = display.pane)
+
+plot(i_showDelta ? cumDelta : na,
+     title = "Cumulative Delta", color = color.new(#42A5F5, 30),
+     linewidth = 2, display = display.pane)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6 — SMART SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── 6a. Absorption Signal ───────────────────────────────────────────────────
+// High volume + tight range → large player absorbing.  Bullish if close near
+// high, bearish if close near low.
+bool absSignalBull = i_showSignals and isAbsorption and closePos > 0.6
+bool absSignalBear = i_showSignals and isAbsorption and closePos < 0.4
+
+plotshape(absSignalBull ? low - atr14 * 0.6 : na,
+     style = shape.diamond, location = location.absolute,
+     color = #00E676, size = size.small, title = "Absorption Buy",
+     text = "ABS", textcolor = #00E676)
+
+plotshape(absSignalBear ? high + atr14 * 0.6 : na,
+     style = shape.diamond, location = location.absolute,
+     color = #FF1744, size = size.small, title = "Absorption Sell",
+     text = "ABS", textcolor = #FF1744)
+
+
+// ── 6b. Breakout with Volume Expansion ──────────────────────────────────────
+float prevHigh = ta.highest(high[1], i_brkLookbk)
+float prevLow  = ta.lowest(low[1], i_brkLookbk)
+
+bool breakoutUp   = i_showSignals and close > prevHigh and relVol > i_brkVolK
+bool breakoutDown = i_showSignals and close < prevLow  and relVol > i_brkVolK
+
+plotshape(breakoutUp ? low - atr14 * 0.9 : na,
+     style = shape.triangleup, location = location.absolute,
+     color = #00E676, size = size.normal, title = "Breakout Up",
+     text = "BRK▲", textcolor = #00E676)
+
+plotshape(breakoutDown ? high + atr14 * 0.9 : na,
+     style = shape.triangledown, location = location.absolute,
+     color = #FF1744, size = size.normal, title = "Breakout Down",
+     text = "BRK▼", textcolor = #FF1744)
+
+
+// ── 6c. Delta Divergence ────────────────────────────────────────────────────
+// Price makes new high but cumulative delta doesn't (bearish divergence)
+// Price makes new low but cumulative delta doesn't (bullish divergence)
+float priceHigh_n = ta.highest(close, i_divLen)
+float priceLow_n  = ta.lowest(close, i_divLen)
+float deltaHigh_n = ta.highest(cumDelta, i_divLen)
+float deltaLow_n  = ta.lowest(cumDelta, i_divLen)
+
+// Current bar is at price extreme but delta is NOT at extreme
+bool bearDiv = i_showSignals and close == priceHigh_n and cumDelta < deltaHigh_n * 0.95
+bool bullDiv = i_showSignals and close == priceLow_n  and cumDelta > deltaLow_n  * 0.95
+
+// Filter: only trigger if we also have notable volume
+bearDiv := bearDiv and relVol > 1.0
+bullDiv := bullDiv and relVol > 1.0
+
+plotshape(bearDiv ? high + atr14 * 1.2 : na,
+     style = shape.xcross, location = location.absolute,
+     color = #FFA726, size = size.small, title = "Bear Divergence",
+     text = "DIV▼", textcolor = #FFA726)
+
+plotshape(bullDiv ? low - atr14 * 1.2 : na,
+     style = shape.xcross, location = location.absolute,
+     color = #26C6DA, size = size.small, title = "Bull Divergence",
+     text = "DIV▲", textcolor = #26C6DA)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 7 — INFO TABLE (Dashboard)
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 6,
+     bgcolor = color.new(#1E1E1E, 10),
+     border_color = color.new(#333333, 0),
+     border_width = 1,
+     frame_color = color.new(#333333, 0),
+     frame_width = 1)
+
+if barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "Metric",
+         text_color = #B0BEC5, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "Value",
+         text_color = #B0BEC5, text_size = size.small, text_halign = text.align_right)
+
+    // Delta
+    table.cell(dash, 0, 1, "Bar Delta",
+         text_color = #ECEFF1, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 1, str.tostring(math.round(delta)),
+         text_color = delta >= 0 ? #00E676 : #FF1744,
+         text_size = size.small, text_halign = text.align_right)
+
+    // Cumulative Delta
+    table.cell(dash, 0, 2, "Cum. Delta",
+         text_color = #ECEFF1, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 2, str.tostring(math.round(cumDelta)),
+         text_color = cumDelta >= 0 ? #00E676 : #FF1744,
+         text_size = size.small, text_halign = text.align_right)
+
+    // Relative Volume
+    table.cell(dash, 0, 3, "Rel. Volume",
+         text_color = #ECEFF1, text_size = size.small, text_halign = text.align_left)
+    string relVolStr = str.tostring(math.round(relVol, 2)) + "x"
+    table.cell(dash, 1, 3, relVolStr,
+         text_color = relVol >= 2.0 ? #FFA726 : #B0BEC5,
+         text_size = size.small, text_halign = text.align_right)
+
+    // Buy Ratio
+    table.cell(dash, 0, 4, "Buy Ratio",
+         text_color = #ECEFF1, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 4, str.tostring(math.round(buyRatio * 100)) + "%",
+         text_color = buyRatio >= 0.5 ? #00E676 : #FF1744,
+         text_size = size.small, text_halign = text.align_right)
+
+    // Close Position
+    table.cell(dash, 0, 5, "Close Pos",
+         text_color = #ECEFF1, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 5, str.tostring(math.round(closePos * 100)) + "%",
+         text_color = closePos >= 0.5 ? #00E676 : #FF1744,
+         text_size = size.small, text_halign = text.align_right)
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(absSignalBull, title = "Absorption Buy",     message = "🟢 Absorption detected — bullish bias")
+alertcondition(absSignalBear, title = "Absorption Sell",    message = "🔴 Absorption detected — bearish bias")
+alertcondition(breakoutUp,    title = "Breakout Up",        message = "🟢 Breakout UP with volume expansion")
+alertcondition(breakoutDown,  title = "Breakout Down",      message = "🔴 Breakout DOWN with volume expansion")
+alertcondition(bullDiv,       title = "Bullish Divergence", message = "🔵 Delta divergence — bullish")
+alertcondition(bearDiv,       title = "Bearish Divergence", message = "🟠 Delta divergence — bearish")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END OF INDICATOR
+// ══════════════════════════════════════════════════════════════════════════════
